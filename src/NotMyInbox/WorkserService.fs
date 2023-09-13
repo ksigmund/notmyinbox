@@ -8,7 +8,7 @@ type Worker(smtpServer : SmtpServer) =
     inherit BackgroundService()
 
     do
-        System.Console.WriteLine "abc"
+        System.Console.WriteLine "Starting BackgroundService"
 
     override this.ExecuteAsync (stoppingToken: CancellationToken) =
         task {
