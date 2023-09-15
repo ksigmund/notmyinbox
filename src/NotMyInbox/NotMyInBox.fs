@@ -11,7 +11,8 @@ open MimeKit
 open MailKit.Net.Smtp
 open System.Buffers
 open System.Threading.Tasks
-open System
+open Azure.Communication.Email
+open Azure
 
 
 // Function to convert a ReadOnlySequence<byte> to a MimeMessage
@@ -25,6 +26,25 @@ let convertBytesToMimeMessage (messageBytes: ReadOnlySequence<byte>) =
     // Load the MimeMessage from the MemoryStream
     MimeMessage.Load(memoryStream)
 
+let ToEmailMessage (mimeMessage: MimeMessage) =
+    let toAddress = mimeMessage.To.Mailboxes |> Seq.head
+    let fromAddress = mimeMessage.From.Mailboxes |> Seq.head
+
+    let content =
+        let c = EmailContent(mimeMessage.Subject)
+        // c.Html <- mimeMessage.HtmlBody
+        c.PlainText <- mimeMessage.TextBody
+        c
+
+    let emailMessage =
+        let e = EmailMessage("DoNotReply@notmyinbox.com", toAddress.Address, content)
+        // e.Headers.Add("Resent-From", fromAddress.Address)
+        e
+
+    emailMessage
+
+
+
 let sendEmail message smtpServer smtpPort (smtpUsername: string) (smtpPassword: string) =
     use client = new SmtpClient()
 
@@ -36,8 +56,7 @@ let sendEmail message smtpServer smtpPort (smtpUsername: string) (smtpPassword: 
         return result
     }
 
-// Implement a type that implements Mailbox
-type MessageStore(cache: IMemoryCache) =
+type MessageStore(cache: IMemoryCache, emailClient: EmailClient) =
     interface IMessageStore with
         member _.SaveAsync
             (
@@ -61,7 +80,13 @@ type MessageStore(cache: IMemoryCache) =
                         message.To.Clear()
                         message.To.Add(MailboxAddress(realAddress, realAddress))
                         cache.Remove(recipientAddress.Address)
-                        let! z = sendEmail message "localhost" 9025 "blah" "blah"
+
+
+                        let message = message |> ToEmailMessage
+
+                        let sendOperation = emailClient.Send(WaitUntil.Started, message)
+
+                        let z = sendOperation.HasCompleted
 
                         return
                             Protocol.SmtpResponse(
@@ -74,8 +99,15 @@ type MessageStore(cache: IMemoryCache) =
                                 SmtpReplyCode.BadEmailAddress,
                                 $"No forwarding rule defined for {recipientAddress}"
                             )
-                with ex ->
-                    return Protocol.SmtpResponse(SmtpReplyCode.RelayDenied, $"Unable to forward email.")
+
+                with
+                | :? RequestFailedException as ex ->
+                    return
+                        Protocol.SmtpResponse(
+                            SmtpReplyCode.RelayDenied,
+                            $"Unable to forward email.  Error code:  {ex.ErrorCode}, Message: {ex.Message}"
+                        )
+                | ex -> return Protocol.SmtpResponse(SmtpReplyCode.RelayDenied, $"Unable to forward email.")
 
             }
 

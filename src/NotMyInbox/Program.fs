@@ -16,6 +16,8 @@ open NotMyInBox.WorkerService
 open System.Net.Mail
 open Microsoft.Extensions.Caching.Memory
 open Messages
+open Microsoft.Extensions.Configuration
+open Azure.Communication.Email
 
 // ---------------------------------
 // Models
@@ -41,17 +43,36 @@ module Views =
 
     let partial () = h1 [] [ encodedText "NotMyInbox" ]
 
-    let index (model: Message) =
-        [ partial (); p [] [ encodedText model.Text ] ] |> layout
+    let emailPageView =
+        [
+          form
+              [ _action "/fwd"; _method "POST" ]
+              [ label [ _for "email" ] [ Text "Email Address:" ]
+                input [ _type "email"; _id "from"; _name "From" ]
+                button [ _type "submit" ] [ Text "Submit" ] ] ]
+        |> layout
+
+    let forwardingRuleCreatedPageView fromAddress toAddress =
+        [ partial (); p [] [ 
+            div [] [
+                Text $"Forwarding rule created from "
+                a [_href $"mailto:{toAddress}"] [Text toAddress]
+                Text $"to {fromAddress}"]
+         ] ] |> layout
+
+    let index =
+        [ partial (); p [] [ emailPageView ] ] |> layout
+
+
 
 // ---------------------------------
 // Web app
 // ---------------------------------
 
-let indexHandler (name: string) =
-    let greetings = sprintf "Hello %s, from Giraffe!" name
-    let model = { Text = greetings }
-    let view = Views.index model
+let indexHandler =
+    // let greetings = sprintf "Hello %s, from Giraffe!" name
+    // let model = { Text = greetings }
+    let view = Views.index
     htmlView view
 
 let sendEmailHandler (recipient: string) : HttpHandler =
@@ -67,10 +88,12 @@ let sendEmailHandler (recipient: string) : HttpHandler =
 [<CLIMutable>]
 type ForwardingRuleRequest = { From: string }
 
-type ForwardingRule = { RealAddress: MailAddress; FwdAddress: MailAddress }
+type ForwardingRule =
+    { RealAddress: MailAddress
+      FwdAddress: MailAddress }
 
-let generateRandomEmailUsername (seedEmail: MailAddress) (mailHost: string) =
-    let random = Random(seedEmail.GetHashCode())
+let generateRandomEmailAddress (mailHost: string) =
+    let random = Random()
     let minLength = 8
     let maxLength = 32
     let alphanumericChars = "abcdefghijklmnopqrstuvwxyz0123456789"
@@ -93,51 +116,39 @@ let (|ValidForwardingRule|_|) (fwdRulesRequest: ForwardingRuleRequest) =
     | (true, from: MailAddress) ->
         Some
             { RealAddress = from
-              FwdAddress = generateRandomEmailUsername from "localhost" }
+              FwdAddress = generateRandomEmailAddress "notmyinbox.com" }
     | _ -> None
 
 let saveForwardingRule (cache: IMemoryCache) fwdRule =
     cache.Set(fwdRule.FwdAddress.Address, fwdRule.RealAddress.Address) |> ignore
     fwdRule.FwdAddress
 
-let setupFwdHander (fwdRuleRequest: ForwardingRuleRequest) : HttpHandler =
+
+let setupFwdHander: HttpHandler =
     fun (next: HttpFunc) (ctx: HttpContext) ->
-        let cache = ctx.GetService<IMemoryCache>()
-
-        let result =
-            match (fwdRuleRequest) with
-            | ValidForwardingRule(fwdRule: ForwardingRule) ->
-                let fwdAddress = saveForwardingRule cache fwdRule
-                Successful.created (json fwdAddress)
-            | _ -> RequestErrors.badRequest (text "Invalid email address")
-
-        result next ctx
+        task {
+            let! fwdRuleRequest = ctx.BindFormAsync<ForwardingRuleRequest>()
+            let cache = ctx.GetService<IMemoryCache>()
+            let result =
+                match (fwdRuleRequest) with
+                | ValidForwardingRule(fwdRule: ForwardingRule) ->
+                    let fwdAddress = saveForwardingRule cache fwdRule
+                    // Successful.created (json fwdAddress)
+                    (Views.forwardingRuleCreatedPageView fwdRuleRequest.From fwdAddress.Address) |> htmlView 
+                | _ -> RequestErrors.badRequest (text "Invalid email address")
+            return! result next ctx
+        }  
 
 let webApp =
-    choose
-        [ GET
-          >=> choose [ 
-                routeBind<ForwardingRuleRequest> "/mail/{from}/fwd" setupFwdHander
-                routef "/mail/%s" sendEmailHandler ] ]
-            
-// choose [
-//     subRoute "/mail" (
-//         choose [
-//             GET >=> choose [
-//                 route "/" >=> sendEmail// make this POST
-//                 routeBind<ForwardingRule> "/%s/to/%s" setupFwdHander // POST eventually
-//             ]
-//         ]
-//     )
-//     GET  >=> choose [
-//         route "/" >=> indexHandler "world";
-//         routef "/hello/%s" indexHandler;
-//         setStatusCode 404 >=> text "Not Found"]
-//     POST >=> choose [
-//         route "/email"
-//     ]
-// ]
-
+    choose [ 
+        GET >=> choose [ 
+            // routef "/fwd/%s" sendEmailHandler
+            route "/" >=> indexHandler
+        ] 
+        POST >=> choose [
+            route "/fwd" >=> setupFwdHander 
+        ]
+    ]
 
 // ---------------------------------
 // Error handler
@@ -182,12 +193,19 @@ let configureServices (services: IServiceCollection) =
         let options =
             (new SmtpServerOptionsBuilder())
                 .ServerName("SMTP Server")
-                .Port(9025)
+                .Port(25)
+                .Port(587)
                 .Port(465, true)
+                .Port(9025)
                 .Build()
 
         let server = new SmtpServer(options, p.GetRequiredService<IServiceProvider>())
         server)
+    |> ignore
+
+    services.AddTransient<EmailClient>(fun p ->
+        let connectionString = Environment.GetEnvironmentVariable("ACS_CONNECTION_STRING")
+        new EmailClient(connectionString))
     |> ignore
 
     services.AddTransient<IMailboxFilter, MessageFilter>() |> ignore
